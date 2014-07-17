@@ -59,9 +59,12 @@
 #define DEFAULT_CURRENCY_CODE   @"USD"
 #define DEFAULT_CURRENCY_SYMBOL @"$"
 
-#define BASE_URL    @"https://blockchain.info"
-#define UNSPENT_URL BASE_URL "/unspent?active="
-#define TICKER_URL  BASE_URL "/ticker"
+#define BLOCKCHAININFO_BASE_URL    @"https://blockchain.info"
+#define BLOCKCHAININFO_UNSPENT_URL BLOCKCHAININFO_BASE_URL "/unspent?active="
+#define TICKER_URL  BLOCKCHAININFO_BASE_URL "/ticker"
+
+#define CHAINCOM_BASE_URL @"https://api.chain.com"
+#define CHAINCOM_API_KEY @"cdd5b262adf84c1a7220c2371fd57def"
 
 static BOOL setKeychainData(NSData *data, NSString *key)
 {
@@ -461,21 +464,66 @@ completion:(void (^)(BRTransaction *tx, NSError *error))completion
         return;
     }
 
-    NSURL *u = [NSURL URLWithString:[UNSPENT_URL stringByAppendingString:address]];
+    NSURL *u = [NSURL URLWithString:[BLOCKCHAININFO_UNSPENT_URL stringByAppendingString:address]];
     NSURLRequest *req = [NSURLRequest requestWithURL:u cachePolicy:NSURLRequestReloadIgnoringCacheData
                          timeoutInterval:20.0];
 
     [NSURLConnection sendAsynchronousRequest:req queue:[NSOperationQueue currentQueue]
     completionHandler:^(NSURLResponse *response, NSData *data, NSError *connectionError) {
         if (connectionError) {
-            completion(nil, connectionError);
+            // If blockchain.info is down, use chain.com
+            NSURL *chainComURL = [NSURL URLWithString:[CHAINCOM_BASE_URL stringByAppendingFormat:@"/v1/bitcoin/addresses/%@/unspents?key=%@", address, CHAINCOM_API_KEY]];
+            NSURLRequest *chainComRequest = [NSURLRequest requestWithURL:chainComURL cachePolicy:NSURLRequestReloadIgnoringCacheData timeoutInterval:20.0];
+            [NSURLConnection sendAsynchronousRequest:chainComRequest queue:[NSOperationQueue currentQueue] completionHandler:^(NSURLResponse *response, NSData *data, NSError *connectionError) {
+                if (connectionError) {
+                    completion(nil, connectionError);
+                    return;
+                }
+                
+                NSError *error = nil;
+                NSArray *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
+                if (error || ! [json isKindOfClass:[NSArray class]]) {
+                    completion(nil, [NSError errorWithDomain:@"BreadWallet" code:417 userInfo:@{NSLocalizedDescriptionKey:
+                                                                                                    [NSString stringWithFormat:NSLocalizedString(@"unexpected response from %@", nil),
+                                                                                                     chainComURL.host]}]);
+                    return;
+                }
+                
+                if ([json count] == 0 ) {
+                    if ([[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] hasPrefix:@"No free outputs"]) {
+                        error = [NSError errorWithDomain:@"BreadWallet" code:417 userInfo:@{NSLocalizedDescriptionKey:
+                                                                                                NSLocalizedString(@"this private key is empty", nil)}];
+                    }
+                    completion(nil, error);
+                    return;
+                }
+
+                NSMutableArray *validUTXOArray = [NSMutableArray array];
+                for (NSDictionary *utxo in json) {
+                    if (! [utxo isKindOfClass:[NSDictionary class]] ||
+                        ! [utxo[@"transaction_hash"] isKindOfClass:[NSString class]] || ! [utxo[@"transaction_hash"] hexToData] ||
+                        ! [utxo[@"output_index"] isKindOfClass:[NSNumber class]] ||
+                        ! [utxo[@"script_hex"] isKindOfClass:[NSString class]] || ! [utxo[@"script_hex"] hexToData] ||
+                        ! [utxo[@"value"] isKindOfClass:[NSNumber class]]) {
+                        completion(nil, [NSError errorWithDomain:@"BreadWallet" code:417 userInfo:@{NSLocalizedDescriptionKey:
+                                                                                                        [NSString stringWithFormat:NSLocalizedString(@"unexpected response from %@", nil),
+                                                                                                         chainComURL.host]}]);
+                        return;
+                    }
+                    
+                    NSDictionary *validUTXO = @{@"tx_hash": [utxo valueForKey:@"transaction_hash"],
+                                                @"tx_output_n": [utxo valueForKey:@"output_index"],
+                                                @"script": [utxo valueForKey:@"script_hex"],
+                                                @"value": [utxo valueForKey:@"value"]};
+                    [validUTXOArray addObject:validUTXO];
+                }
+                [self sweepPrivateKey:privKey unspentOutputs:validUTXOArray withFee:fee completion:completion];
+            }];
             return;
         }
 
         NSError *error = nil;
         NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
-        uint64_t balance = 0, standardFee = 0;
-        BRTransaction *tx = [BRTransaction new];
 
         if (error) {
             if ([[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] hasPrefix:@"No free outputs"]) {
@@ -496,6 +544,8 @@ completion:(void (^)(BRTransaction *tx, NSError *error))completion
         }
 
         //TODO: make sure not to create a transaction larger than TX_MAX_SIZE
+        NSMutableArray *validUTXOArray = [NSMutableArray array];
+        
         for (NSDictionary *utxo in json[@"unspent_outputs"]) {
             if (! [utxo isKindOfClass:[NSDictionary class]] ||
                 ! [utxo[@"tx_hash"] isKindOfClass:[NSString class]] || ! [utxo[@"tx_hash"] hexToData] ||
@@ -507,39 +557,50 @@ completion:(void (^)(BRTransaction *tx, NSError *error))completion
                                   u.host]}]);
                 return;
             }
-
-            [tx addInputHash:[utxo[@"tx_hash"] hexToData] index:[utxo[@"tx_output_n"] unsignedIntegerValue]
-             script:[utxo[@"script"] hexToData]];
-            balance += [utxo[@"value"] unsignedLongLongValue];
+            [validUTXOArray addObject:utxo];
         }
-
-        if (balance == 0) {
-            completion(nil, [NSError errorWithDomain:@"BreadWallet" code:417 userInfo:@{NSLocalizedDescriptionKey:
-                             NSLocalizedString(@"this private key is empty", nil)}]);
-            return;
-        }
-
-        // we will be adding a wallet output (additional 34 bytes)
-        //TODO: calculate the median of the lowest fee-per-kb that made it into the previous 144 blocks (24hrs)
-        if (fee) standardFee = ((tx.size + 34 + 999)/1000)*TX_FEE_PER_KB;
-
-        if (standardFee + TX_MIN_OUTPUT_AMOUNT > balance) {
-            completion(nil, [NSError errorWithDomain:@"BreadWallet" code:417 userInfo:@{NSLocalizedDescriptionKey:
-                             NSLocalizedString(@"transaction fees would cost more than the funds available on this "
-                                               "private key (due to tiny \"dust\" deposits)",nil)}]);
-            return;
-        }
-
-        [tx addOutputAddress:[self.wallet changeAddress] amount:balance - standardFee];
-
-        if (! [tx signWithPrivateKeys:@[privKey]]) {
-            completion(nil, [NSError errorWithDomain:@"BreadWallet" code:401 userInfo:@{NSLocalizedDescriptionKey:
-                             NSLocalizedString(@"error signing transaction", nil)}]);
-            return;
-        }
-
-        completion(tx, nil);
+        
+        [self sweepPrivateKey:privKey unspentOutputs:validUTXOArray withFee:fee completion:completion];
     }];
+}
+
+- (void)sweepPrivateKey:(NSString *)privKey unspentOutputs:(NSArray *)unspentOutputs withFee:(BOOL)fee
+                        completion:(void (^)(BRTransaction *tx, NSError *error))completion {
+    uint64_t balance = 0, standardFee = 0;
+    BRTransaction *tx = [BRTransaction new];
+
+    for (NSDictionary *utxo in unspentOutputs) {
+        [tx addInputHash:[utxo[@"tx_hash"] hexToData] index:[utxo[@"tx_output_n"] unsignedIntegerValue]
+                  script:[utxo[@"script"] hexToData]];
+        balance += [utxo[@"value"] unsignedLongLongValue];
+    }
+    
+    if (balance == 0) {
+        completion(nil, [NSError errorWithDomain:@"BreadWallet" code:417 userInfo:@{NSLocalizedDescriptionKey:
+                                                                                        NSLocalizedString(@"this private key is empty", nil)}]);
+        return;
+    }
+    
+    // we will be adding a wallet output (additional 34 bytes)
+    //TODO: calculate the median of the lowest fee-per-kb that made it into the previous 144 blocks (24hrs)
+    if (fee) standardFee = ((tx.size + 34 + 999)/1000)*TX_FEE_PER_KB;
+    
+    if (standardFee + TX_MIN_OUTPUT_AMOUNT > balance) {
+        completion(nil, [NSError errorWithDomain:@"BreadWallet" code:417 userInfo:@{NSLocalizedDescriptionKey:
+                                                                                        NSLocalizedString(@"transaction fees would cost more than the funds available on this "
+                                                                                                          "private key (due to tiny \"dust\" deposits)",nil)}]);
+        return;
+    }
+    
+    [tx addOutputAddress:[self.wallet changeAddress] amount:balance - standardFee];
+    
+    if (! [tx signWithPrivateKeys:@[privKey]]) {
+        completion(nil, [NSError errorWithDomain:@"BreadWallet" code:401 userInfo:@{NSLocalizedDescriptionKey:
+                                                                                        NSLocalizedString(@"error signing transaction", nil)}]);
+        return;
+    }
+    
+    completion(tx, nil);
 }
 
 #pragma mark - string helpers
